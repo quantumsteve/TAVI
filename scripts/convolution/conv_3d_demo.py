@@ -7,42 +7,53 @@ import numpy as np
 from matplotlib.patches import Ellipse
 from numba import njit, prange
 
+from phonopy import load
+#phonon = load('phonopy.yaml')
+# This is for phonon calculations
+#mesh = [11, 11, 11]  # Sampling mesh in the first BZ for Debye-Waller factor calculation
+#scattering_lengths = {'Ge': 8.185}
+#temperature = 300
+#cutoff = 8e-2
+#phonon.run_mesh(mesh,
+#                is_mesh_symmetry=False, # symmetry must be off
+#                with_eigenvectors=True) # eigenvectors must be true
+
+class model_info:
+    def __init__(self):
+        self.phonon = load('phonopy.yaml')
+        self.mesh = [11, 11, 11]
+        self.phonon.run_mesh(self.mesh, is_mesh_symmetry=False, with_eigenvectors=True)
+        self.scattering_lengths = {'Ge': 8.185}
+        self.temperature = 300
+        self.cutoff = 8e-2
+
+def init_model():
+    global data
+    data = model_info()
 
 # -------------------------------------------------------
 # user input model_disp and model_inten
 # -------------------------------------------------------
-def model_disp(vq1, vq2, vq3):
+def model_disp(vq1, vq2, vq3, data):
     """return energy for given Q points
-    3d FM J=-1 meV S=1, en=6*S*J*(1-cos(Q))
     """
 
-    sj = 5
-    # gamma_q = np.cos(2 * np.pi * vq1)
-    gamma_q = (np.cos(2 * np.pi * vq1) + np.cos(2 * np.pi * vq2) + np.cos(2 * np.pi * vq3)) / 3
-
-    disp = 2 * sj * (1 - gamma_q)
-    disp = np.array((disp - 2, disp + 2))
-
-    # reshape if only one band
-    num_disp = len(disp.shape)
-    if num_disp == 1:
-        disp = np.reshape(disp, (1, np.size(disp)))
-    return disp
+    Qpoints = np.column_stack([vq1,vq2,vq3])
+    Q_prim = np.dot(Qpoints, data.phonon.primitive_matrix)
+    data.phonon.run_qpoints(Q_prim, with_eigenvectors=False)
+    band_dict = data.phonon.get_qpoints_dict()
+    return np.transpose(band_dict['frequencies'])
 
 
-def model_inten(vq1, vq2, vq3):
+def model_inten(vq1, vq2, vq3, data):
     """return intensity for given Q points
-    3d FM J=-1 meV S=1, inten = S/2 for all Qs
     """
-    inten = np.ones_like(vq1, dtype=float) / 2
-    inten = np.array((inten, inten))
-
-    # reshape if only one band
-    num_inten = len(inten.shape)
-    if num_inten == 1:
-        inten = np.reshape(inten, (1, np.size(inten)))
-
-    return inten
+    Qpoints = np.column_stack([vq1,vq2,vq3])
+    Q_prim = np.dot(Qpoints, data.phonon.primitive_matrix)
+    data.phonon.run_dynamic_structure_factor(Q_prim, data.temperature,
+    scattering_lengths=data.scattering_lengths, freq_min=data.cutoff)
+    dsf = data.phonon.dynamic_structure_factor
+    return np.transpose(dsf.dynamic_structure_factors)
 
 
 # -------------------------------------------------------
@@ -204,7 +215,7 @@ def get_max_step(arr, axis: int):
     return float(np.nanmax(steps))
 
 
-def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
+def convolution(reso_params, data, energy_rez_factor=1 / 5, max_step=100):
     """Perform the convolution
     The maxium sampling box size in Q is (max_step, max_step ,max_step)
 
@@ -243,7 +254,7 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     # ----------------------------------------------------
     pts = [10, 10, 10]
     (vqh, vqk, vql), idx = generate_pts(sigma_qs, mat_hkl, num_of_sigmas, tuple(pts))
-    disp = model_disp(vqh + qh, vqk + qk, vql + ql)
+    disp = model_disp(vqh + qh, vqk + qk, vql + ql, data)
     num_bands, num_pts = disp.shape
 
     # Retrun zero if all dispersion is outside the relevant energy window
@@ -278,7 +289,7 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     # Enough sampled. Calculate weight from resolution function
     # ----------------------------------------------------
     (vqh, vqk, vql), idx = generate_pts(sigma_qs, mat_hkl, num_of_sigmas, tuple(pts))
-    disp = model_disp(vqh + qh, vqk + qk, vql + ql)
+    disp = model_disp(vqh + qh, vqk + qk, vql + ql, data)
     _, num_pts = disp.shape
 
     vq = np.array((vqh, vqk, vql))  # shape: (3, num_pts)
@@ -297,7 +308,7 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     print(f"Number of pts inside the ellipsoid = {num_pts_keep}, percentage ={percent_kep:.3f}%")
 
     weights_filtered = np.exp(-weights[:, idx_keep] / 2)
-    inten = model_inten(*vq_filtered)
+    inten = model_inten(*vq_filtered, data)
     # normalization by elementary volume size
     elem_vols /= np.prod(pts)
     det = np.linalg.det(mat)
@@ -311,8 +322,8 @@ if __name__ == "__main__":
     # qe_mesh has the dimension (4, n_pts_of_measurement)
     # flatten for meshed measurement
     # ----------------------------------------------------
-    q1_min, q1_max, q1_step = 2, 3, 0.02
-    en_min, en_max, en_step = -3, 25, 0.5
+    q1_min, q1_max, q1_step = 2, 2.02, 0.02
+    en_min, en_max, en_step = 1, 2, 1.0
     q2 = 0
     q3 = 0
 
@@ -324,17 +335,20 @@ if __name__ == "__main__":
     q_list = np.stack((vq1.ravel(), vq2.ravel(), vq3.ravel()), axis=-1)
     reso_params = resolution_matrix(hkl=q_list, en=en)
 
+    #data = model_info()
+
     t0 = time()
     # ------------------- multiprocessing ------------------
-    num_worker = 8
-    with ProcessPoolExecutor(max_workers=num_worker) as executor:
-        results = executor.map(convolution, reso_params)
-    measurement_inten = np.asarray(list(results))
+    #num_worker = 8
+    #with ProcessPoolExecutor(max_workers=num_worker, initializer=init_model) as executor:
+    #    results = executor.map(convolution, reso_params)
+    #measurement_inten = np.asarray(list(results))
     # ------------------- single core ------------------
-    # sz = len(reso_params)
-    # measurement_inten = np.empty(shape=sz)
-    # for i in range(sz):
-    #     measurement_inten[i] = convolution(reso_params[i])
+    data = model_info()
+    sz = len(reso_params)
+    measurement_inten = np.empty(shape=sz)
+    for i in range(sz):
+        measurement_inten[i] = convolution(reso_params[i], data)
     # --------------------------------------------------
 
     print(f"Convolution completed in {(t1 := time()) - t0:.4f} s")
@@ -355,7 +369,7 @@ if __name__ == "__main__":
     ax.set_ylim((en_min, en_max))
 
     plot_rez_ellipses(ax)
-    disp = model_disp(q1, np.zeros_like(q1), np.zeros_like(q1))
+    disp = model_disp(q1, np.zeros_like(q1), np.zeros_like(q1), data)
     for i in range(np.shape(disp)[0]):
         ax.plot(q1, disp[i], "-w")
 
